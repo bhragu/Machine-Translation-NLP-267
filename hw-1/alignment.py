@@ -1,95 +1,132 @@
-#!/usr/bin/env python
+import sys
 import optparse
 import sys
 
-import numpy as np
+from collections import defaultdict
+
 
 optparser = optparse.OptionParser()
 optparser.add_option("-d", "--data", dest="train", default="data/hansards", help="Data filename prefix (default=data)")
 optparser.add_option("-e", "--english", dest="english", default="e", help="Suffix of English filename (default=e)")
 optparser.add_option("-f", "--french", dest="french", default="f", help="Suffix of French filename (default=f)")
-optparser.add_option("-t", "--threshold", dest="threshold", default=0.5, type="float", help="Threshold for aligning with Dice's coefficient (default=0.5)")
 optparser.add_option("-n", "--num_sentences", dest="num_sents", default=100000000000, type="int", help="Number of sentences to use for training and alignment")
 (opts, _) = optparser.parse_args()
 f_data = "%s.%s" % (opts.train, opts.french)
 e_data = "%s.%s" % (opts.train, opts.english)
 
-def train_ibm1(source_corpus, target_corpus, n_iters):
-    sys.stdout.write("Training with IBM-1...\n")
-    num_sentences = len(source_corpus)
-    source_vocab = set()
-    target_vocab = set()
-    for source_sentence, target_sentence in zip(source_corpus, target_corpus):
-        source_vocab.update(source_sentence)
-        target_vocab.update(target_sentence)
-    source_vocab = list(source_vocab)
-    target_vocab = list(target_vocab)
-    source_vocab_size = len(source_vocab)
-    target_vocab_size = len(target_vocab)
-    t = np.zeros((source_vocab_size, target_vocab_size)) + 1.0 / target_vocab_size
+
+class Alignment:
+    """
+    A class to store the word alignment and its related information
     
-    for i in range(n_iters):
-        # E-step: Compute the expected counts
-        counts = np.zeros((source_vocab_size, target_vocab_size))
-        total_counts = np.zeros(target_vocab_size)
-        for source_sentence, target_sentence in zip(source_corpus, target_corpus):
-            source_sentence_idx = [source_vocab.index(word) for word in source_sentence]
-            target_sentence_idx = [target_vocab.index(word) for word in target_sentence]
-            for source_word_idx in source_sentence_idx:
-                normalization = np.sum([t[source_word_idx][j] for j in target_sentence_idx])
-                for target_word_idx in target_sentence_idx:
-                    counts[source_word_idx][target_word_idx] += t[source_word_idx][target_word_idx] / normalization
-                    total_counts[target_word_idx] += t[source_word_idx][target_word_idx] / normalization
-        # M-step: Update the alignment probabilities
-        for j in range(target_vocab_size):
-            for i in range(source_vocab_size):
-                t[i][j] = counts[i][j] / total_counts[j]
-    return t, source_vocab, target_vocab
+    Attributes:
+    f_sent (list): List of words in the foreign sentence
+    e_sent (list): List of words in the target sentence
+    f_index (dict): A dictionary where the keys are the words in f_sent and the values are the indices of those words
+    e_index (dict): A dictionary where the keys are the words in e_sent and the values are the indices of those words
+    """
+    def __init__(self, f_sent, e_sent):
+        """
+        Initializes the Alignment class with the foreign and target sentences
+        """
+        self.f_sent = f_sent
+        self.e_sent = e_sent
+        self.f_index = defaultdict(list)
+        self.e_index = defaultdict(list)
+        # Indexing the words in f_sent
+        for i, f_word in enumerate(f_sent):
+            self.f_index[f_word].append(i)
+        # Indexing the words in e_sent
+        for i, e_word in enumerate(e_sent):
+            self.e_index[e_word].append(i)
 
-def align_ibm1(source_sentence, target_sentence, t, source_vocab, target_vocab):
-    source_sentence_idx = [source_vocab.index(word) for word in source_sentence]
-    target_sentence_idx = [target_vocab.index(word) for word in target_sentence]
-    alignment = []
-    for source_word_idx in source_sentence_idx:
-        max_prob = 0
-        best_j = -1
-        for target_word_idx in target_sentence_idx:
-            if t[source_word_idx][target_word_idx] > max_prob:
-                max_prob = t[source_word_idx][target_word_idx]
-                best_j = target_word_idx
-        alignment.append((source_word_idx, best_j))
-    return alignment
 
-def align_corpus(source_corpus, target_corpus, t, source_vocab, target_vocab):
-    alignments = []
-    for source_sentence, target_sentence in zip(source_corpus, target_corpus):
-        alignments.append(align_ibm1(source_sentence, target_sentence, t, source_vocab, target_vocab))
-    return alignments
+# Define the EM algorithm for IBM Model 1
+def em_ibm1(sentences, iterations):
+    """
+    The EM algorithm for IBM Model 1
 
+    Parameters:
+    sentences (list): List of Alignment objects containing the foreign and target sentences
+    iterations (int): Number of iterations for the EM algorithm
+
+    Returns:
+    dict: A dictionary where the keys are tuples of target word and foreign word and the values are the estimated translation probabilities t(e|f)
+    """
+    t = defaultdict(float)
+    count = defaultdict(float)
+    total = defaultdict(float)
+
+    # Initialize t(e|f) uniformly
+    for alignment in sentences:
+        for f_word in alignment.f_sent:
+            for e_word in alignment.e_sent:
+                t[(e_word, f_word)] = 1.0 / len(alignment.e_sent)
+
+    for i in range(iterations):
+        # Initialize count(e|f) to
+        count.clear()
+        # Initialize total(f) to 0
+        total.clear()
+
+        # Compute normalization
+        for alignment in sentences:
+            for f_word in alignment.f_sent:
+                s_total = 0
+                for e_word in alignment.e_sent:
+                    s_total += t[(e_word, f_word)]
+                for e_word in alignment.e_sent:
+                    c = t[(e_word, f_word)] / s_total
+                    count[(e_word, f_word)] += c
+                    total[f_word] += c
+
+        # Re-estimate probabilities
+        for e_word, f_word in count.keys():
+            t[(e_word, f_word)] = count[(e_word, f_word)] / total[f_word]
+
+    return t
+
+
+def print_alignments(sentences, t):
+    """
+    Prints the alignments between the source and target sentences based on the translation probabilities.
+    
+    Parameters:
+    sentences (list): A list of sentence objects, where each sentence object contains source and target sentences.
+    t (dict): A dictionary representing the translation probabilities, with tuples of target and source words as keys and their probability as values.
+    
+    Returns:
+    None
+    """
+    for alignment in sentences:
+        for i, f_word in enumerate(alignment.f_sent):
+            best_p = 0
+            best_j = 0
+            for j, e_word in enumerate(alignment.e_sent):
+                p = t[(e_word, f_word)]
+                if p > best_p:
+                    best_p = p
+                    best_j = j
+            sys.stdout.write("%i-%i " % (i, best_j))
+        sys.stdout.write("\n")
 
 def main():
+    """
+    The main function that reads in the data, trains the IBM Model 1 using the Expectation Maximization (EM) algorithm,
+    and prints the final alignments.
+    
+    Returns:
+    None
+    """
     # Read in the data
-    bitext = [[sentence.strip().split() for sentence in pair] for pair in zip(open(f_data), open(e_data))][:opts.num_sents]
-    
-    # source_corpus is a list of source sentences
-    source_corpus = [pair[0] for pair in bitext]
-    # target_corpus is a list of target sentences
-    target_corpus = [pair[1] for pair in bitext]
+    f_sentences = [line.strip().split() for line in open(f_data, "r")][:opts.num_sents]
+    e_sentences = [line.strip().split() for line in open(e_data, "r")][:opts.num_sents]
+    sentences = [Alignment(f_sent, e_sent) for f_sent, e_sent in zip(f_sentences, e_sentences)]
 
-    num_iterations = 5
+    num_iterations = 10
+    t = em_ibm1(sentences, num_iterations)
+    print_alignments(sentences, t)
     
-    # Train IBM Model 1
-    t, source_vocab, target_vocab = train_ibm1(source_corpus, target_corpus, n_iters=num_iterations)
-    
-    # Align the corpus using IBM Model 1
-    alignments = align_corpus(source_corpus, target_corpus, t, source_vocab, target_vocab)
-    
-    for source_sentence, target_sentence, alignment in zip(source_corpus, target_corpus, alignments):
-        print("Source Sentence:", " ".join(source_sentence))
-        print("Target Sentence:", " ".join(target_sentence))
-        print("Alignment:", alignment)
-        print()
-
-if __name__ == '__main__':
+# Main function
+if __name__ == "__main__":
     main()
-    
