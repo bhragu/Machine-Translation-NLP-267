@@ -3,13 +3,13 @@ import optparse
 import sys
 
 from collections import defaultdict
-
+from tqdm import tqdm
 
 optparser = optparse.OptionParser()
 optparser.add_option("-d", "--data", dest="train", default="data/hansards", help="Data filename prefix (default=data)")
 optparser.add_option("-e", "--english", dest="english", default="e", help="Suffix of English filename (default=e)")
 optparser.add_option("-f", "--french", dest="french", default="f", help="Suffix of French filename (default=f)")
-optparser.add_option("-n", "--num_sentences", dest="num_sents", default=100000000000, type="int", help="Number of sentences to use for training and alignment")
+optparser.add_option("-n", "--num_sentences", dest="num_sents", default=100000, type="int", help="Number of sentences to use for training and alignment")
 (opts, _) = optparser.parse_args()
 f_data = "%s.%s" % (opts.train, opts.french)
 e_data = "%s.%s" % (opts.train, opts.english)
@@ -18,7 +18,7 @@ e_data = "%s.%s" % (opts.train, opts.english)
 class Alignment:
     """
     A class to store the word alignment and its related information
-    
+
     Attributes:
     f_sent (list): List of words in the foreign sentence
     e_sent (list): List of words in the target sentence
@@ -58,24 +58,24 @@ def em_ibm1(sentences, iterations):
     total = defaultdict(float)
 
     # Initialize t(e|f) uniformly
-    for alignment in sentences:
+    for alignment in tqdm(sentences):
         for f_word in alignment.f_sent:
             for e_word in alignment.e_sent:
                 t[(e_word, f_word)] = 1.0 / len(alignment.e_sent)
 
-    for i in range(iterations):
-        # Initialize count(e|f) to
+    for i in tqdm(range(iterations)):
+        # Initialize count(e|f) to 0
         count.clear()
         # Initialize total(f) to 0
         total.clear()
 
         # Compute normalization
-        for alignment in sentences:
-            for f_word in alignment.f_sent:
+        for alignment in tqdm(sentences):
+            for e_word in alignment.e_sent:
                 s_total = 0
-                for e_word in alignment.e_sent:
+                for f_word in alignment.f_sent:
                     s_total += t[(e_word, f_word)]
-                for e_word in alignment.e_sent:
+                for f_word in alignment.f_sent:
                     c = t[(e_word, f_word)] / s_total
                     count[(e_word, f_word)] += c
                     total[f_word] += c
