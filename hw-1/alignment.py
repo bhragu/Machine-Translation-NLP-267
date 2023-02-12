@@ -70,16 +70,6 @@ def em_ibm1(sentences, iterations):
         total.clear()
 
         # Compute normalization
-        # for alignment in tqdm(sentences):
-        #     for f_word in alignment.f_sent:
-        #         s_total = 0
-        #         for e_word in alignment.e_sent:
-        #             s_total += t[(e_word, f_word)]
-        #         for e_word in alignment.e_sent:
-        #             c = t[(e_word, f_word)] / s_total
-        #             count[(e_word, f_word)] += c
-        #             total[f_word] += c
-
         for alignment in tqdm(sentences):
             for e_word in alignment.e_sent:
                 s_total = 0
