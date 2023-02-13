@@ -10,13 +10,13 @@ Student Id: 2005986
 ```bash
 Name: Bhrigu Garg
 Email: bgarg@ucsc.edu
-Student Id: 
+Student Id: 2006380
 ```
 
 ```bash
 Name: Brian Farrell
 Email: bfarrel1@ucsc.edu
-Student Id: 
+Student Id: 2006370
 ```
 
 ```bash
