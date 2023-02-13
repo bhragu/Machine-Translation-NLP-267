@@ -40,3 +40,8 @@ python alignment.py n -100000 -i 10 | python score-alignments.py
 ```
 
 This command will run and evaluate IBM Model 1.
+
+here,
+
+- n = number of sentences to use for training and alignment
+- i = number of iterations of em algorithm
