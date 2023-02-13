@@ -10,6 +10,7 @@ optparser.add_option("-d", "--data", dest="train", default="data/hansards", help
 optparser.add_option("-e", "--english", dest="english", default="e", help="Suffix of English filename (default=e)")
 optparser.add_option("-f", "--french", dest="french", default="f", help="Suffix of French filename (default=f)")
 optparser.add_option("-n", "--num_sentences", dest="num_sents", default=100000, type="int", help="Number of sentences to use for training and alignment")
+optparser.add_option("-i", "--num_iterations", dest="num_iters", default=10, type="int", help="Number of iterations for EM algorithm")
 (opts, _) = optparser.parse_args()
 f_data = "%s.%s" % (opts.train, opts.french)
 e_data = "%s.%s" % (opts.train, opts.english)
@@ -58,19 +59,19 @@ def em_ibm1(sentences, iterations):
     total = defaultdict(float)
 
     # Initialize t(e|f) uniformly
-    for alignment in tqdm(sentences):
+    for alignment in tqdm(sentences, colour='red'):
         for f_word in alignment.f_sent:
             for e_word in alignment.e_sent:
                 t[(e_word, f_word)] = 1.0 / len(alignment.e_sent)
 
-    for i in tqdm(range(iterations)):
+    for i in tqdm(range(iterations), colour='green'):
         # Initialize count(e|f) to 0
         count.clear()
         # Initialize total(f) to 0
         total.clear()
 
         # Compute normalization
-        for alignment in tqdm(sentences):
+        for alignment in tqdm(sentences, colour='cyan'):
             for e_word in alignment.e_sent:
                 s_total = 0
                 for f_word in alignment.f_sent:
@@ -123,7 +124,7 @@ def main():
     e_sentences = [line.strip().split() for line in open(e_data, "r")][:opts.num_sents]
     sentences = [Alignment(f_sent, e_sent) for f_sent, e_sent in zip(f_sentences, e_sentences)]
 
-    num_iterations = 10
+    num_iterations = opts.num_iters
     t = em_ibm1(sentences, num_iterations)
     print_alignments(sentences, t)
     
