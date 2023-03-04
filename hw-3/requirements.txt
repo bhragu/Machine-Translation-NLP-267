@@ -1,0 +1,5 @@
+matplotlib
+nltk==3.3.0
+torch
+torchvision
+torchaudio
