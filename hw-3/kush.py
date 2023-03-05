@@ -42,9 +42,9 @@ ap.add_argument('--seed', default=42, type=int,
                 help='random seed')
 ap.add_argument('--hidden_size', default=256, type=int,
                 help='hidden size of encoder/decoder, also word vector size')
-ap.add_argument('--batch_size', default=16, type=int,
+ap.add_argument('--batch_size', default=8, type=int,
                 help='batch size')
-ap.add_argument('--num_epochs', default=1, type=int,
+ap.add_argument('--num_epochs', default=5, type=int,
                 help='num epochs')
 ap.add_argument('--n_iters', default=8000, type=int,
                 help='total number of examples to train on')
@@ -52,6 +52,8 @@ ap.add_argument('--teacher_forcing_rate', default=0.0, type=float,
                 help='teacher forcing rate')
 ap.add_argument('--print_every', default=5000, type=int,
                 help='print loss info every this many training examples')
+ap.add_argument('--dropout', default=0.2, type=float, 
+                help='dropout rate')
 ap.add_argument('--checkpoint_every', default=10000, type=int,
                 help='write out checkpoint every this many training examples')
 ap.add_argument('--initial_learning_rate', default=0.001, type=int,
@@ -106,21 +108,23 @@ def make_reproducible(seed: int=42) -> None:
 
 SOS_token = "<SOS>"
 EOS_token = "<EOS>"
+PAD_token = "<PAD>"
 
 SOS_index = 0
 EOS_index = 1
+PAD_index = 2
 MAX_LENGTH = 15
 
 
 class Vocab:
-    """This class handles the mapping between the words and their indicies
+    """This class handles the mapping between the words and their indices
     """
     def __init__(self, lang_code):
         self.lang_code = lang_code
         self.word2index = {}
         self.word2count = {}
-        self.index2word = {SOS_index: SOS_token, EOS_index: EOS_token}
-        self.n_words = 2  # Count SOS and EOS
+        self.index2word = {SOS_index: SOS_token, EOS_index: EOS_token, PAD_index: PAD_token}
+        self.n_words = 3  # Count SOS, EOS and PAD
 
     def add_sentence(self, sentence):
         for word in sentence.split(' '):
@@ -241,8 +245,7 @@ class AttnDecoderRNN(nn.Module):
         self.dropout = nn.Dropout(self.dropout_p)
         self.batch_size = batch_size
 
-        """Initialize your word embedding, decoder LSTM, and weights needed for your attention here"""
-        self.embed = nn.Embedding(output_size, self.hidden_size)
+        self.embedding = nn.Embedding(output_size, self.hidden_size)
         self.attn = nn.Linear(self.effective_hidden_size, self.effective_hidden_size)
         self.lstm = nn.LSTM(self.hidden_size*3 if self.bidirectional else self.hidden_size*2, 
                         hidden_size,
@@ -256,8 +259,8 @@ class AttnDecoderRNN(nn.Module):
         
         Dropout (self.dropout) should be applied to the word embeddings.
         """
-        x = self.embed(input)
-        x = self.dropout(x)
+        embedded = self.embedding(input)
+        embedded = self.dropout(embedded)
 
         # Do attention here
         seq_len = encoder_outputs.shape[1]
@@ -274,7 +277,7 @@ class AttnDecoderRNN(nn.Module):
         context = attn_weights.unsqueeze(1).bmm(encoder_outputs)
 
         # Combine embedded input word and attended context, run through RNN
-        rnn_input = torch.cat((x, context), 2)
+        rnn_input = torch.cat((embedded, context), 2)
         output, hidden = self.lstm(rnn_input, hidden)
         output = self.out(output)
         log_softmax = F.log_softmax(output, dim=-1)
@@ -284,9 +287,7 @@ class AttnDecoderRNN(nn.Module):
 
 ######################################################################
 
-def train(input_tensor, target_tensor, encoder, decoder, 
-        optimizer, criterion, max_length=MAX_LENGTH,
-        teacher_forcing_rate=0.0):
+def train(input_tensor, target_tensor, encoder, decoder, optimizer, criterion, max_length=MAX_LENGTH, teacher_forcing_rate=0.0):
     # make sure the encoder and decoder are in training mode so dropout is applied
     encoder.train()
     decoder.train()
@@ -304,7 +305,7 @@ def train(input_tensor, target_tensor, encoder, decoder,
     loss = 0
 
     for target_idx in range(target_tensor.size(1)):
-        decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input, decoder_hidden, encoder_outputs)
+        decoder_output, decoder_hidden, _ = decoder(decoder_input, decoder_hidden, encoder_outputs)
         loss += criterion(decoder_output.squeeze(1), target_tensor[:,target_idx])
         teacher_force = random.uniform(0, 1)
         if teacher_force < teacher_forcing_rate:
@@ -346,7 +347,6 @@ def translate(encoder, decoder, sentence, src_vocab, tgt_vocab, max_length=MAX_L
             # Adjust for max length vs length of sequence
             decoder_attentions[di,:decoder_attention.shape[-1]] = decoder_attention.data
             topv, topi = decoder_output.data.topk(1)
-            # import ipdb;ipdb.set_trace()
             if topi.item() == EOS_index:
                 decoded_words.append(EOS_token)
                 break
@@ -465,7 +465,7 @@ def main():
     decoder = AttnDecoderRNN(hidden_size=args.hidden_size, 
                              output_size=tgt_vocab.n_words, 
                              batch_size=args.batch_size, 
-                             dropout_p=0.1).to(device)
+                             dropout_p=args.dropout).to(device)
 
     # Encoder/decoder weights are randomly initilized
     # If checkpointed, load saved weights
@@ -492,34 +492,35 @@ def main():
     # If checkpointed, load saved state
     if args.load_checkpoint is not None:
         optimizer.load_state_dict(state['opt_state'])
-        
-    # class TrainDataset(Dataset):
-    #     def __init__(self, training_pairs) -> None:
-    #         self.training_pairs = training_pairs
-    #         self.input_pairs = [t[0] for t in self.training_pairs]
-    #         self.target_pairs = [t[1] for t in self.training_pairs]
     
-    #     def __len__(self) -> int:
-    #         return len(self.training_pairs)
+    # Set up training data using vocab
+    training_pairs = [tensors_from_pair(src_vocab, tgt_vocab, t) for t in train_pairs]
     
-    #     def __getitem__(self, idx):
-    #         return self.input_pairs[idx], self.target_pairs[idx]
+    class TrainDataset(Dataset):
+        """Custom Dataset for loading train data."""
+        def __init__(self, training_pairs) -> None:
+            self.training_pairs = training_pairs
+            self.input_pairs = [t[0] for t in self.training_pairs]
+            self.target_pairs = [t[1] for t in self.training_pairs]
+    
+        def __len__(self) -> int:
+            return len(self.training_pairs)
+    
+        def __getitem__(self, idx) -> tuple[torch.Tensor, torch.Tensor]:
+            return self.input_pairs[idx], self.target_pairs[idx]
         
-    # def custom_collate_fn(batch):
-    #     input_tensors, target_tensors = zip(*batch)
-    #     input_tensors = torch.nn.utils.rnn.pad_sequence(input_tensors, batch_first=True, padding_value=EOS_index).squeeze(-1)
-    #     target_tensors = torch.nn.utils.rnn.pad_sequence(target_tensors, batch_first=True, padding_value=EOS_index).squeeze(-1)
-    #     return input_tensors, target_tensors
+    def custom_collate_fn(batch):
+        """Custom collate function to pad sequences to the same length."""
+        input_tensors, target_tensors = zip(*batch)
+        input_tensors = torch.nn.utils.rnn.pad_sequence(input_tensors, batch_first=True, padding_value=PAD_index).squeeze(-1)
+        target_tensors = torch.nn.utils.rnn.pad_sequence(target_tensors, batch_first=True, padding_value=PAD_index).squeeze(-1)
+        return input_tensors, target_tensors
     
     # Batchify Training Data using DataLoader
-    training_pairs = [tensors_from_pair(src_vocab, tgt_vocab, t) for t in train_pairs]
-    input_tensors = [t[0] for t in training_pairs]
-    target_tensors = [t[1] for t in training_pairs]
-    input_tensors = torch.nn.utils.rnn.pad_sequence(input_tensors, batch_first=True, padding_value=EOS_index).squeeze(-1)
-    target_tensors = torch.nn.utils.rnn.pad_sequence(target_tensors, batch_first=True, padding_value=EOS_index).squeeze(-1)
-    train_data = TensorDataset(input_tensors, target_tensors)
-    train_loader = DataLoader(train_data, batch_size=args.batch_size, drop_last=True)
-    
+    train_data = TrainDataset(training_pairs)
+    train_loader = DataLoader(train_data, batch_size=args.batch_size, drop_last=True, shuffle=True, collate_fn=custom_collate_fn)
+
+    # Train the model for a number of epochs
     for epoch in tqdm(range(args.num_epochs), desc=f"Training...", colour="red"):
         print_loss_total = 0 # Reset every epoch
         start = time.time()
@@ -538,7 +539,7 @@ def main():
         end = time.time()
         elapsed_time = end - start
         logging.info(f"Epoch {epoch+1:02} Loss: {print_loss_avg:.4}| Epoch {epoch+1:02} Time: {elapsed_time:.2f} sec")
-        print("*"*50)
+        print("*"*100)
         
         state = {'epoch_num': epoch+1,
                 'enc_state': encoder.state_dict(),
@@ -556,7 +557,7 @@ def main():
         torch.save(state, filename)
         logging.debug('Wrote checkpoint to %s', filename)
     
-    # Translate from the dev set
+    # Translate from the dev set and compute BLEU score
     translated_sentences = translate_sentences(encoder, decoder, dev_pairs, src_vocab, tgt_vocab)
     references = [[clean(pair[1]).split(), ] for pair in dev_pairs]
     candidates = [clean(sent).split() for sent in translated_sentences]
