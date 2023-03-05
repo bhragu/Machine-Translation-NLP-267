@@ -25,7 +25,7 @@ import matplotlib.ticker as ticker
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, Dataset, DataLoader
 from nltk.translate.bleu_score import corpus_bleu
 from torch import optim
 from tqdm import tqdm
@@ -42,12 +42,14 @@ ap.add_argument('--seed', default=42, type=int,
                 help='random seed')
 ap.add_argument('--hidden_size', default=256, type=int,
                 help='hidden size of encoder/decoder, also word vector size')
-ap.add_argument('--batch_size', default=8, type=int,
+ap.add_argument('--batch_size', default=16, type=int,
                 help='batch size')
 ap.add_argument('--num_epochs', default=1, type=int,
                 help='num epochs')
 ap.add_argument('--n_iters', default=8000, type=int,
                 help='total number of examples to train on')
+ap.add_argument('--teacher_forcing_rate', default=0.0, type=float,
+                help='teacher forcing rate')
 ap.add_argument('--print_every', default=5000, type=int,
                 help='print loss info every this many training examples')
 ap.add_argument('--checkpoint_every', default=10000, type=int,
@@ -197,125 +199,131 @@ def tensors_from_pair(src_vocab, tgt_vocab, pair):
 ######################################################################
 
 
+
 class EncoderRNN(nn.Module):
-    """The class for the enoder RNN
-    """
-    def __init__(self, input_size, hidden_size):
+    """the class for the encoder RNN"""
+    def __init__(self, input_size, hidden_size, batch_size, bidirectional=False):
         super(EncoderRNN, self).__init__()
         self.hidden_size = hidden_size
-        """Initilize a word embedding and bi-directional GRU encoder"""
+        self.input_size = input_size
+        self.bidirectional = bidirectional
+        self.batch_size = batch_size
         self.embedding = nn.Embedding(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
-
+        self.lstm = nn.LSTM(self.hidden_size, self.hidden_size, batch_first=True, bidirectional=bidirectional)
 
     def forward(self, input, hidden):
-        """Runs the forward pass of the encoder
+        """runs the forward pass of the encoder
         returns the output and the hidden state
         """
-        embedded = self.embedding(input).view(1, 1, -1)
-        output = embedded
-        output, hidden = self.gru(output, hidden)
+        embedded = self.embedding(input)
+        output, hidden = self.lstm(embedded, hidden)
         return output, hidden
 
-    def get_initial_hidden_state(self):
-        return torch.zeros(1, 1, self.hidden_size, device=device)
+    def get_initial_hidden_state(self, bsz=None):
+        D = 2 if self.bidirectional else 1
+        if bsz is None:
+            bsz = self.batch_size
+        return (torch.zeros(D, bsz, self.hidden_size, device=device),
+                torch.zeros(D, bsz, self.hidden_size, device=device))
 
 
 class AttnDecoderRNN(nn.Module):
-    """The class for the decoder 
+    """the class for the decoder 
     """
-    def __init__(self, hidden_size, output_size, dropout_p=0.1, max_length=MAX_LENGTH):
+    def __init__(self, hidden_size, output_size, batch_size, dropout_p=0.1, max_length=MAX_LENGTH, bidirectional=False):
         super(AttnDecoderRNN, self).__init__()
         self.hidden_size = hidden_size
+        self.effective_hidden_size = hidden_size*2 if bidirectional else self.hidden_size
         self.output_size = output_size
         self.dropout_p = dropout_p
         self.max_length = max_length
-
-        self.embedding = nn.Embedding(self.output_size, self.hidden_size)
-        self.attn = nn.Linear(self.hidden_size * 2, self.max_length)
-        self.attn_combine = nn.Linear(self.hidden_size * 2, self.hidden_size)
+        self.bidirectional = bidirectional
         self.dropout = nn.Dropout(self.dropout_p)
-        self.gru = nn.GRU(self.hidden_size, self.hidden_size)
-        self.out = nn.Linear(self.hidden_size, self.output_size)
+        self.batch_size = batch_size
+
+        """Initialize your word embedding, decoder LSTM, and weights needed for your attention here"""
+        self.embed = nn.Embedding(output_size, self.hidden_size)
+        self.attn = nn.Linear(self.effective_hidden_size, self.effective_hidden_size)
+        self.lstm = nn.LSTM(self.hidden_size*3 if self.bidirectional else self.hidden_size*2, 
+                        hidden_size,
+                        batch_first=True, 
+                        bidirectional=self.bidirectional)
+        self.out = nn.Linear(self.effective_hidden_size, self.output_size)
 
     def forward(self, input, hidden, encoder_outputs):
-        """Runs the forward pass of the decoder
+        """runs the forward pass of the decoder
         returns the log_softmax, hidden state, and attn_weights
         
         Dropout (self.dropout) should be applied to the word embeddings.
         """
+        x = self.embed(input)
+        x = self.dropout(x)
 
-        embedded = self.embedding(input).view(1, 1, -1)
-        embedded = self.dropout(embedded)
+        # Do attention here
+        seq_len = encoder_outputs.shape[1]
+        batch_size = input.shape[0]
+        attn_energies = torch.zeros((batch_size, seq_len), device=device)
+        for i in range(seq_len):
+            energies = self.attn(encoder_outputs[:,i])
+            attn_energies[:,i] =torch.bmm(
+                                        hidden[0].view(batch_size, 1, self.effective_hidden_size), 
+                                        energies.view(batch_size, self.effective_hidden_size, 1)
+                                        ).squeeze(-1).squeeze(-1)
+        attn_weights = F.softmax(attn_energies, dim=1)
+        # context: an attention-weighted average of encoder outputs
+        context = attn_weights.unsqueeze(1).bmm(encoder_outputs)
 
-        attn_weights = F.softmax(
-            self.attn(torch.cat((embedded[0], hidden[0]), 1)), dim=1)
-        attn_applied = torch.bmm(attn_weights.unsqueeze(0),
-                                 encoder_outputs.unsqueeze(0))
-
-        output = torch.cat((embedded[0], attn_applied[0]), 1)
-        output = self.attn_combine(output).unsqueeze(0)
-
-        output = F.relu(output)
-        output, hidden = self.gru(output, hidden)
-
-        output = F.log_softmax(self.out(output[0]), dim=1)
-        return output, hidden, attn_weights
-
-    def get_initial_hidden_state(self):
-        return torch.zeros(1, 1, self.hidden_size, device=device)
+        # Combine embedded input word and attended context, run through RNN
+        rnn_input = torch.cat((x, context), 2)
+        output, hidden = self.lstm(rnn_input, hidden)
+        output = self.out(output)
+        log_softmax = F.log_softmax(output, dim=-1)
+        
+        return log_softmax, hidden, attn_weights
 
 
 ######################################################################
 
-def train(input_batch, target_batch, encoder, decoder, optimizer, criterion, max_length=MAX_LENGTH):
-    """Runs the training loop for a single batch"""
-    encoder_hidden = encoder.get_initial_hidden_state()
-
+def train(input_tensor, target_tensor, encoder, decoder, 
+        optimizer, criterion, max_length=MAX_LENGTH,
+        teacher_forcing_rate=0.0):
     # make sure the encoder and decoder are in training mode so dropout is applied
     encoder.train()
     decoder.train()
 
     optimizer.zero_grad()
+    
+    # ENCODER
+    encoder_hidden = encoder.get_initial_hidden_state()
+    encoder_outputs, encoder_hidden = encoder(input_tensor, encoder_hidden)
 
-    input_length = input_batch.size(1)
-    target_length = target_batch.size(1)
-
-    encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device)
-
+    # DECODER
+    decoder_input = torch.zeros((encoder_outputs.shape[0], 1), device=device, dtype=torch.long)
+    decoder_input[:,0] = SOS_index
+    decoder_hidden = (encoder_hidden[0].to(device), encoder_hidden[1].to(device))  # Use last hidden state from encoder to start decoder
     loss = 0
 
-    for ei in range(input_length):
-        encoder_output, encoder_hidden = encoder(
-            input_batch[:, ei], encoder_hidden)
-        encoder_outputs[ei] = encoder_output[0, 0]
-
-    decoder_input = torch.tensor([[SOS_index]], device=device)
-
-    decoder_hidden = encoder_hidden
-
-    # Use its own predictions as the next input
-    for di in range(target_length):
-        decoder_output, decoder_hidden, decoder_attention = decoder(
-            decoder_input, decoder_hidden, encoder_outputs)
-        topv, topi = decoder_output.topk(1)
-        decoder_input = topi.squeeze().detach()  # detach from history as input
-
-        loss += criterion(decoder_output, target_batch[:, di])
-        if decoder_input.item() == EOS_token:
-            break
-
+    for target_idx in range(target_tensor.size(1)):
+        decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input, decoder_hidden, encoder_outputs)
+        loss += criterion(decoder_output.squeeze(1), target_tensor[:,target_idx])
+        teacher_force = random.uniform(0, 1)
+        if teacher_force < teacher_forcing_rate:
+            decoder_input = target_tensor[:,target_idx].unsqueeze(1)
+        else:
+            _, topi = decoder_output.data.topk(1)
+            next_idxs = topi.squeeze(-1)
+            decoder_input = next_idxs
+    loss /= target_tensor.size(1)
     loss.backward()
     optimizer.step()
-    return loss.item() / target_length
 
-
+    return loss.item() 
 
 ######################################################################
 
 def translate(encoder, decoder, sentence, src_vocab, tgt_vocab, max_length=MAX_LENGTH):
     """
-    Runs tranlsation, returns the output and attention
+    runs tranlsation, returns the output and attention
     """
 
     # switch the encoder and decoder to eval mode so they are not applying dropout
@@ -325,43 +333,35 @@ def translate(encoder, decoder, sentence, src_vocab, tgt_vocab, max_length=MAX_L
     with torch.no_grad():
         input_tensor = tensor_from_sentence(src_vocab, sentence)
         input_length = input_tensor.size()[0]
-        encoder_hidden = encoder.get_initial_hidden_state()
+        encoder_hidden = encoder.get_initial_hidden_state(bsz=1)
+        encoder_outputs, encoder_hidden = encoder(input_tensor.T, encoder_hidden)
 
-        encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device)
-
-        for ei in range(input_length):
-            encoder_output, encoder_hidden = encoder(input_tensor[ei],
-                                                     encoder_hidden)
-            encoder_outputs[ei] += encoder_output[0, 0]
-
-        decoder_input = torch.tensor([[SOS_index]], device=device)
-
+        decoder_input = torch.tensor([[SOS_index]], device=device, dtype=torch.long)
         decoder_hidden = encoder_hidden
-
         decoded_words = []
         decoder_attentions = torch.zeros(max_length, max_length)
 
         for di in range(max_length):
-            decoder_output, decoder_hidden, decoder_attention = decoder(
-                decoder_input, decoder_hidden, encoder_outputs)
-            decoder_attentions[di] = decoder_attention.data
+            decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input, decoder_hidden, encoder_outputs)
+            # Adjust for max length vs length of sequence
+            decoder_attentions[di,:decoder_attention.shape[-1]] = decoder_attention.data
             topv, topi = decoder_output.data.topk(1)
+            # import ipdb;ipdb.set_trace()
             if topi.item() == EOS_index:
                 decoded_words.append(EOS_token)
                 break
             else:
                 decoded_words.append(tgt_vocab.index2word[topi.item()])
 
-            decoder_input = topi.squeeze().detach()
+            decoder_input = topi.squeeze(1).detach()
 
         return decoded_words, decoder_attentions[:di + 1]
 
 
 ######################################################################
 
-# Translate (dev/test)set takes in a list of sentences and writes out their transaltes
+# Translate (dev/test)set takes in a list of sentences and writes out their translations
 def translate_sentences(encoder, decoder, pairs, src_vocab, tgt_vocab, max_num_sentences=None, max_length=MAX_LENGTH):
-    """Translates a list of sentences and returns the output sentences"""
     output_sentences = []
     for pair in pairs[:max_num_sentences]:
         output_words, attentions = translate(encoder, decoder, pair[0], src_vocab, tgt_vocab)
@@ -376,7 +376,6 @@ def translate_sentences(encoder, decoder, pairs, src_vocab, tgt_vocab, max_num_s
 #
 
 def translate_random_sentence(encoder, decoder, pairs, src_vocab, tgt_vocab, n=1):
-    """Translates a random sentence from the list of pairs"""
     for i in range(n):
         pair = random.choice(pairs)
         print('>', pair[0])
@@ -412,22 +411,22 @@ def show_attention(input_sentence, output_words, attentions, i=0):
     ax.set_xticklabels(output_words, rotation=90)
     ax.set_yticks(np.arange(len(input_words)))
     ax.set_yticklabels(input_words)
-
-    # Save figure to file
+    
+    # Save Checkpoint
     path = "./plots"
     if not os.path.exists(path):
         os.makedirs(path)
-    plt.savefig(os.path.join(path, f"attentions-{i}.png"))
+    filename = os.path.join(path, f"attentions-{i}.png")
+    plt.savefig(filename)
     fig.clear()
 
 
-def translate_and_show_attention(input_sentence, encoder1, decoder1, src_vocab, tgt_vocab, i):
-    """Translate a sentence and show the attention plot."""
+def translate_and_show_attention(input_sentence, encoder1, decoder1, src_vocab, tgt_vocab, i=0):
     output_words, attentions = translate(
         encoder1, decoder1, input_sentence, src_vocab, tgt_vocab)
     print('input =', input_sentence)
     print('output =', ' '.join(output_words))
-    show_attention(input_sentence, output_words, attentions, i)
+    show_attention(input_sentence, output_words, attentions, i=i)
 
 
 def clean(strx):
@@ -449,7 +448,8 @@ def main():
     # Create vocab from training data, or load if checkpointed
     # Also set iteration 
     if args.load_checkpoint is not None:
-        state = torch.load(args.load_checkpoint[0])
+        filename = os.path.join('./checkpoints', args.load_checkpoint[0])
+        state = torch.load(filename)
         iter_num = state['iter_num']
         src_vocab = state['src_vocab']
         tgt_vocab = state['tgt_vocab']
@@ -459,8 +459,13 @@ def main():
                                            args.tgt_lang,
                                            args.train_file)
 
-    encoder = EncoderRNN(src_vocab.n_words, args.hidden_size).to(device)
-    decoder = AttnDecoderRNN(args.hidden_size, tgt_vocab.n_words, dropout_p=0.1).to(device)
+    encoder = EncoderRNN(input_size=src_vocab.n_words, 
+                         hidden_size=args.hidden_size, 
+                         batch_size=args.batch_size).to(device)
+    decoder = AttnDecoderRNN(hidden_size=args.hidden_size, 
+                             output_size=tgt_vocab.n_words, 
+                             batch_size=args.batch_size, 
+                             dropout_p=0.1).to(device)
 
     # Encoder/decoder weights are randomly initilized
     # If checkpointed, load saved weights
@@ -469,7 +474,7 @@ def main():
         decoder.load_state_dict(state['dec_state'])
 
     # Read in datafiles
-    train_pairs = split_lines(args.train_file)
+    train_pairs = split_lines(args.train_file)[:args.n_iters]
     dev_pairs = split_lines(args.dev_file)
     test_pairs = split_lines(args.test_file)
     
@@ -478,15 +483,6 @@ def main():
     logging.info(f"Number of dev examples: {len(dev_pairs)}")
     logging.info(f"Number of test examples: {len(test_pairs)}")
     
-    # Batchify Training Data using DataLoader
-    training_pairs = [tensors_from_pair(src_vocab, tgt_vocab, t) for t in train_pairs]
-    input_tensors = [t[0] for t in training_pairs]
-    target_tensors = [t[1] for t in training_pairs]
-    input_tensors = torch.nn.utils.rnn.pad_sequence(input_tensors, batch_first=True, padding_value=EOS_index).squeeze(-1)
-    target_tensors = torch.nn.utils.rnn.pad_sequence(target_tensors, batch_first=True, padding_value=EOS_index).squeeze(-1)
-    train_data = TensorDataset(input_tensors, target_tensors)
-    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
-
     # Set up Optimization/Loss
     params = list(encoder.parameters()) + list(decoder.parameters())  # .parameters() returns generator
     optimizer = optim.Adam(params, lr=args.initial_learning_rate)
@@ -496,15 +492,45 @@ def main():
     # If checkpointed, load saved state
     if args.load_checkpoint is not None:
         optimizer.load_state_dict(state['opt_state'])
-    
-    for epoch in range(args.num_epochs):
-        print_loss_total = 0
-        start = time.time()
         
-        pbar = tqdm(enumerate(train_loader), desc=f"Training for Epoch {epoch+1:02}...", colour="red")
-        for _, (input_batch, target_batch) in pbar:
-            loss = train(input_batch, target_batch, encoder,
-                         decoder, optimizer, criterion)
+    # class TrainDataset(Dataset):
+    #     def __init__(self, training_pairs) -> None:
+    #         self.training_pairs = training_pairs
+    #         self.input_pairs = [t[0] for t in self.training_pairs]
+    #         self.target_pairs = [t[1] for t in self.training_pairs]
+    
+    #     def __len__(self) -> int:
+    #         return len(self.training_pairs)
+    
+    #     def __getitem__(self, idx):
+    #         return self.input_pairs[idx], self.target_pairs[idx]
+        
+    # def custom_collate_fn(batch):
+    #     input_tensors, target_tensors = zip(*batch)
+    #     input_tensors = torch.nn.utils.rnn.pad_sequence(input_tensors, batch_first=True, padding_value=EOS_index).squeeze(-1)
+    #     target_tensors = torch.nn.utils.rnn.pad_sequence(target_tensors, batch_first=True, padding_value=EOS_index).squeeze(-1)
+    #     return input_tensors, target_tensors
+    
+    # Batchify Training Data using DataLoader
+    training_pairs = [tensors_from_pair(src_vocab, tgt_vocab, t) for t in train_pairs]
+    input_tensors = [t[0] for t in training_pairs]
+    target_tensors = [t[1] for t in training_pairs]
+    input_tensors = torch.nn.utils.rnn.pad_sequence(input_tensors, batch_first=True, padding_value=EOS_index).squeeze(-1)
+    target_tensors = torch.nn.utils.rnn.pad_sequence(target_tensors, batch_first=True, padding_value=EOS_index).squeeze(-1)
+    train_data = TensorDataset(input_tensors, target_tensors)
+    train_loader = DataLoader(train_data, batch_size=args.batch_size, drop_last=True)
+    
+    for epoch in tqdm(range(args.num_epochs), desc=f"Training...", colour="red"):
+        print_loss_total = 0 # Reset every epoch
+        start = time.time()
+        for _, (input_batch, target_batch) in tqdm(enumerate(train_loader)):
+            loss = train(input_batch, 
+                         target_batch, 
+                         encoder,
+                         decoder, 
+                         optimizer, 
+                         criterion, 
+                         teacher_forcing_rate=args.teacher_forcing_rate)
             print_loss_total += loss
 
         # Log loss and time
@@ -512,6 +538,7 @@ def main():
         end = time.time()
         elapsed_time = end - start
         logging.info(f"Epoch {epoch+1:02} Loss: {print_loss_avg:.4}| Epoch {epoch+1:02} Time: {elapsed_time:.2f} sec")
+        print("*"*50)
         
         state = {'epoch_num': epoch+1,
                 'enc_state': encoder.state_dict(),
@@ -520,12 +547,13 @@ def main():
                 'src_vocab': src_vocab,
                 'tgt_vocab': tgt_vocab,
                 }
+        
         # Save Checkpoint
         path = "./checkpoints"
         if not os.path.exists(path):
             os.makedirs(path)
         filename = os.path.join(path, "state_%010d.pt" % epoch)
-        torch.save(state, os.path.join(path, filename))
+        torch.save(state, filename)
         logging.debug('Wrote checkpoint to %s', filename)
     
     # Translate from the dev set
