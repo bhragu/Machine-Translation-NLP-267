@@ -203,7 +203,6 @@ def tensors_from_pair(src_vocab, tgt_vocab, pair):
 ######################################################################
 
 
-
 class EncoderRNN(nn.Module):
     """the class for the encoder RNN"""
     def __init__(self, input_size, hidden_size, batch_size, bidirectional=False):
@@ -213,27 +212,24 @@ class EncoderRNN(nn.Module):
         self.bidirectional = bidirectional
         self.batch_size = batch_size
         self.embedding = nn.Embedding(input_size, hidden_size)
-        self.lstm = nn.LSTM(self.hidden_size, self.hidden_size, batch_first=True, bidirectional=bidirectional)
+        self.gru = nn.GRU(self.hidden_size, self.hidden_size, batch_first=True, bidirectional=bidirectional)
 
     def forward(self, input, hidden):
         """runs the forward pass of the encoder
         returns the output and the hidden state
         """
         embedded = self.embedding(input)
-        output, hidden = self.lstm(embedded, hidden)
+        output, hidden = self.gru(embedded, hidden)
         return output, hidden
 
     def get_initial_hidden_state(self, bsz=None):
         D = 2 if self.bidirectional else 1
         if bsz is None:
             bsz = self.batch_size
-        return (torch.zeros(D, bsz, self.hidden_size, device=device),
-                torch.zeros(D, bsz, self.hidden_size, device=device))
+        return torch.zeros(D, bsz, self.hidden_size, device=device)
 
 
 class AttnDecoderRNN(nn.Module):
-    """the class for the decoder 
-    """
     def __init__(self, hidden_size, output_size, batch_size, dropout_p=0.1, max_length=MAX_LENGTH, bidirectional=False):
         super(AttnDecoderRNN, self).__init__()
         self.hidden_size = hidden_size
@@ -247,38 +243,30 @@ class AttnDecoderRNN(nn.Module):
 
         self.embedding = nn.Embedding(output_size, self.hidden_size)
         self.attn = nn.Linear(self.effective_hidden_size, self.effective_hidden_size)
-        self.lstm = nn.LSTM(self.hidden_size*3 if self.bidirectional else self.hidden_size*2, 
-                        hidden_size,
-                        batch_first=True, 
-                        bidirectional=self.bidirectional)
+        self.gru = nn.GRU(self.hidden_size*3 if self.bidirectional else self.hidden_size*2, 
+                          hidden_size,
+                          batch_first=True, 
+                          bidirectional=self.bidirectional)
         self.out = nn.Linear(self.effective_hidden_size, self.output_size)
 
     def forward(self, input, hidden, encoder_outputs):
-        """runs the forward pass of the decoder
-        returns the log_softmax, hidden state, and attn_weights
-        
-        Dropout (self.dropout) should be applied to the word embeddings.
-        """
         embedded = self.embedding(input)
         embedded = self.dropout(embedded)
 
-        # Do attention here
         seq_len = encoder_outputs.shape[1]
         batch_size = input.shape[0]
         attn_energies = torch.zeros((batch_size, seq_len), device=device)
         for i in range(seq_len):
             energies = self.attn(encoder_outputs[:,i])
             attn_energies[:,i] =torch.bmm(
-                                        hidden[0].view(batch_size, 1, self.effective_hidden_size), 
+                                        hidden.view(batch_size, 1, self.effective_hidden_size), 
                                         energies.view(batch_size, self.effective_hidden_size, 1)
                                         ).squeeze(-1).squeeze(-1)
         attn_weights = F.softmax(attn_energies, dim=1)
-        # context: an attention-weighted average of encoder outputs
         context = attn_weights.unsqueeze(1).bmm(encoder_outputs)
 
-        # Combine embedded input word and attended context, run through RNN
         rnn_input = torch.cat((embedded, context), 2)
-        output, hidden = self.lstm(rnn_input, hidden)
+        output, hidden = self.gru(rnn_input, hidden)
         output = self.out(output)
         log_softmax = F.log_softmax(output, dim=-1)
         
@@ -301,7 +289,7 @@ def train(input_tensor, target_tensor, encoder, decoder, optimizer, criterion, m
     # DECODER
     decoder_input = torch.zeros((encoder_outputs.shape[0], 1), device=device, dtype=torch.long)
     decoder_input[:,0] = SOS_index
-    decoder_hidden = (encoder_hidden[0].to(device), encoder_hidden[1].to(device))  # Use last hidden state from encoder to start decoder
+    decoder_hidden = encoder_hidden.to(device)  # Use last hidden state from encoder to start decoder
     loss = 0
 
     for target_idx in range(target_tensor.size(1)):
@@ -318,7 +306,8 @@ def train(input_tensor, target_tensor, encoder, decoder, optimizer, criterion, m
     loss.backward()
     optimizer.step()
 
-    return loss.item() 
+    return loss.item()
+
 
 ######################################################################
 
@@ -539,7 +528,7 @@ def main():
         end = time.time()
         elapsed_time = end - start
         logging.info(f"Epoch {epoch+1:02} Loss: {print_loss_avg:.4}| Epoch {epoch+1:02} Time: {elapsed_time:.2f} sec")
-        print("*"*100)
+        print("="*190)
         
         state = {'epoch_num': epoch+1,
                 'enc_state': encoder.state_dict(),
